@@ -1,0 +1,578 @@
+from __future__ import print_function
+
+import os.path
+import os
+import sys
+import numpy as np
+import scipy.spatial
+import scipy.stats
+import time
+from itertools import groupby
+
+from sklearn import mixture
+
+import matplotlib as mpl
+from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
+
+from astroquery.gaia import Gaia
+from astroquery.simbad import Simbad
+from astropy.io.votable import parse_single_table
+from astropy.io import ascii
+from astropy.table import Table, vstack, unique
+from astropy.coordinates import SkyCoord, Galactic
+from astropy import units
+
+
+
+
+from astropy.visualization import quantity_support
+quantity_support()
+ 
+
+import numpy as np
+from sklearn.mixture import GaussianMixture
+from scipy.spatial import distance
+import astropy.units as u
+import scipy.special as special
+import scipy.stats as stats
+
+import astropy.coordinates as coord
+import math
+import pandas as pd
+
+
+
+con=[]
+
+
+
+
+"""
+Mahalanobis distance
+
+Returns the Mahalanobis distance from a point index ih of an (N-dimensional) array Xall, with inverted covariance matrix Cinv, to the (Ndense)th nearest neighbour
+"""
+def Mahalanobis_distance(Xall,Cinv, ih, Ndense=20):
+	dall = np.zeros(Xall.shape[1])
+	for iden in range(len(dall)):
+		dall[iden] = distance.mahalanobis(Xall.T[ih],Xall.T[iden],  Cinv)
+	dN =np.sort(dall)[Ndense]
+	return dN
+
+
+"""
+gauss
+
+Return values of a gaussian function (val) given a mean, variance, and weight (normalisation)
+"""
+def gauss(val, mean, var, weight):
+	std = np.sqrt(var)
+	exp_comp = np.exp(-0.5*((val-mean)/std)**2)
+	return weight*exp_comp/(2.*np.sqrt(np.pi)*std)
+
+
+"""
+gauss_fit
+
+Fit a multi (between Nmin and Nmax) component Gaussian to a given distribution of points (data)
+Outputs the model parameter
+"""
+def gauss_fit(data, Nmin=2, Nmax=2):
+	N = np.arange(Nmin, Nmax+1)
+	models = [None for i in range(len(N))]
+
+	for i in range(len(N)):
+		models[i] = GaussianMixture(N[i]).fit(data.reshape(-1,1))
+
+	# compute the AIC and the BIC
+	AIC = [m.aic(data.reshape(-1,1)) for m in models]
+	BIC = [m.bic(data.reshape(-1,1)) for m in models]
+	mod_h = models[np.argmin(AIC)]
+
+	ms_h = mod_h.means_[:,0]
+	covs_h = mod_h.covariances_[:,0,0]
+	weights_h = mod_h.weights_[:]
+	covs_h=  covs_h[np.argsort(ms_h)]
+	ms_h = ms_h[np.argsort(ms_h)]
+	weights_h = weights_h[np.argsort(ms_h)]
+	
+	return mod_h, AIC, BIC, ms_h, covs_h, weights_h, np.argsort(ms_h)
+
+
+"""
+density
+
+Calculate the relative phase space densities of stars from the gaia catalogue
+Arguments should include parallax, ra, dec, proper motions in ra and dec - all with units, plus vrad if 6D. 
+Can also contain the index of the 'host star' (ih), the number of neighbours used for the density calculation (Ndense), the number of stars for which to calculate the density (NST), a pre-calculated covariance matrix of appropriate dimension, a subset of stars for which to calculate the densiies (subarr - replaces NST), a radius of a sphere in which to draw stars on which to perform the density calculations (subsize), flag to perform the calculations on the velocities only (Vonly), and the minimum number of astrometric datapoints (stars) to perform the analysis (Nmin).
+"""
+def density(pllx, ra, dec, pmra, pmdec, ih=None, Ndense=20, NST=1,   Cmat=None, vrad=None, subarr=None, subsize=None, Vonly=False, Nmin=50):
+
+	dense = np.zeros(NST)
+	dist = pllx.to(u.pc, equivalencies=u.parallax())
+	c = coord.ICRS(ra=ra, dec=dec,  distance=pllx.to(u.pc, equivalencies=u.parallax()))
+	gc= c.transform_to(coord.Galactocentric)
+	x = gc.x
+	y = gc.y
+	z = gc.z
+
+	ih_ss = ih
+	if type(vrad)==type(None):
+		Xall = np.array([x, y, z, pmra/pllx,pmdec/pllx])
+		if len(x)<Nmin:
+			print('Insufficient astrometric datapoints (Nmin = %d):'%(Nmin), len(x))
+			return None, None, None, None, None
+		if Vonly:
+			Xall = np.array([pmra/pllx,pmdec/pllx])		
+	else:
+		vr_inds = np.where(~np.isnan(vrad))[0]
+		if type(ih)!=type(None):
+			if not ih in vr_inds or len(vr_inds)<2*Ndense:
+				print('No radial velocity measurement for stellar host:', ih)
+				return None, None, None, None, None
+			ih_ss = np.where(vr_inds==ih)[0]
+		elif len(vr_inds)<Nmin:
+			print('Insufficient stars with radial velocities (Nmin = %d):'%(Nmin), len(vr_inds))
+			return None, None, None, None, None
+			
+		x = x[vr_inds]
+		y = y[vr_inds]
+		z = z[vr_inds]
+		ra = ra[vr_inds]
+		dec= dec[vr_inds]
+		dist = dist[vr_inds]
+		pmra = pmra[vr_inds]
+		pmdec = pmdec[vr_inds]
+		pllx = pllx[vr_inds]
+		vrad = vrad[vr_inds]
+		
+		
+		c = coord.ICRS(ra=ra, dec=dec,  distance=pllx.to(u.pc, u.parallax()),   pm_ra_cosdec=pmra, pm_dec=pmdec, radial_velocity=vrad)
+		gc= c.transform_to(coord.Galactocentric)
+		x = gc.x
+		y = gc.y
+		z = gc.z
+		vx = gc.v_x
+		vy = gc.v_y
+		vz = gc.v_z
+
+		Xall = np.array([x, y, z,vx, vy,vz])
+		if Vonly:
+			Xall = np.array([vx, vy,vz])
+			
+
+
+	Ndims = Xall.shape[0]
+	if type(Cmat)==type(None):
+		Cmat = np.cov(Xall)
+	Cinv = np.linalg.inv(Cmat) 
+	
+	if type(ih)!=type(None):
+		dN =  Mahalanobis_distance(Xall,  Cinv, ih_ss, Ndense=Ndense)
+		dense_host= float(Ndense)/(dN**Ndims)
+		xh = x[ih_ss]
+		yh = y[ih_ss]
+		zh = z[ih_ss]
+	else:
+		dense_host= None
+		xh = np.median(x)
+		yh = np.median(y)
+		zh = np.median(z)
+	
+
+	if type(subsize)!=type(None):
+		xtmp =(x-xh)/u.pc
+		ytmp =(y-yh)/u.pc
+		ztmp = (z-zh)/u.pc
+		drhost2 = (xtmp*xtmp+ytmp*ytmp+ztmp*ztmp)
+		isub_init= np.where(drhost2<subsize*subsize)[0]
+	else:
+		isub_init = np.arange(len(x))
+	
+	if type(subarr)!=type(None):
+		NST = len(subarr)
+		dense= np.zeros(NST)
+		isub = subarr
+	elif NST<len(isub_init):
+		dense = np.zeros(NST)
+		isub = np.random.choice(isub_init, size=NST, replace=False)
+	else:
+		isub =isub_init
+		dense = np.zeros(len(isub_init))
+
+	ict=0
+	for ist in isub:
+		dN = Mahalanobis_distance(Xall,  Cinv, ist, Ndense=Ndense)
+		dense[ict]= float(Ndense)/(dN**Ndims)
+		ict+=1
+
+	norm_dense = np.median(dense)
+	dense /= norm_dense
+	
+	if type(dense_host)!=type(None):
+		dense_host /= norm_dense
+
+	if type(vrad)!=type(None):
+		isub = vr_inds[isub]
+		
+	return dense_host, norm_dense, dense, isub, Cmat
+	
+	
+"""
+analyse_densedist
+Input: dense_orig = array of phase space densities
+dense_host = exoplanet host phase space density (or None)
+
+Output: if dense_host is not None, returns Phigh of the host and Pnull that the distribution of densities is lognormally distributed 
+Otherwise an array with all probablities from dense_orig are returned
+"""
+def analyse_densedist(dense_orig, dense_host=None, dfilt_th=2.0,modparams=False):
+	dfilt = np.where((dense_orig>np.percentile(dense_orig,dfilt_th))&(dense_orig<np.percentile(dense_orig,100.-dfilt_th)))[0]
+	dense = dense_orig[dfilt]
+	
+	norm_dense=np.median(dense)
+	dense /= norm_dense	
+	dense_orig/=norm_dense
+	mod_h, AIC, BIC, ms_h, covs_h, weights_h, isrt_h= gauss_fit(np.log10(dense), Nmin=2, Nmax=2)
+	
+
+	if type(dense_host)!=type(None):
+		mod_n, AIC_n, BIC_n, ms_n, covs_n, weights_n, isrt_n = gauss_fit(np.log10(dense), Nmin=1, Nmax=1)
+		
+		def cdf(d):
+			xtmp = (np.log10(d)-ms_n[0])/(np.sqrt(2.)*np.sqrt(covs_n[0]))
+			erf = special.erf(xtmp)
+			return 0.5*(1.+erf)
+
+		
+		nres =  stats.kstest(dense_orig, cdf, args=(), N=20, alternative='two-sided', mode='approx')
+		Pnull = nres[1]
+
+		isrt  = np.argsort(ms_h)
+		
+		prob1 = gauss(np.log10(dense_host/norm_dense), ms_h[isrt[0]], covs_h[isrt[0]], weights_h[isrt[0]])
+		prob2 = gauss(np.log10(dense_host/norm_dense), ms_h[isrt[1]], covs_h[isrt[1]], weights_h[isrt[1]])
+
+		
+		Phigh =  prob2/(prob2+prob1)
+		Plow =  prob1/(prob2+prob1)
+
+	else:
+		isrt  = np.argsort(ms_h)
+		
+		prob1 = gauss(np.log10(dense_orig), ms_h[isrt[0]], covs_h[isrt[0]], weights_h[isrt[0]])
+		prob2 = gauss(np.log10(dense_orig), ms_h[isrt[1]], covs_h[isrt[1]], weights_h[isrt[1]])
+
+		
+		#Best single lognormal fit to the density distribution
+		mod_n, AIC_n, BIC_n, ms_n, covs_n, weights_n, isrt_n = gauss_fit(np.log10(dense), Nmin=1, Nmax=1)
+		
+		def cdf(d):
+			xtmp = (np.log10(d)-ms_n[0])/(np.sqrt(2.)*np.sqrt(covs_n[0]))
+			erf = special.erf(xtmp)
+			return 0.5*(1.+erf)
+		
+		Phigh =  prob2/(prob2+prob1)
+		Plow =  prob1/(prob2+prob1)
+
+		#Return KS test that the density distribution follows a lognormal function
+		nres =  stats.kstest(dense, cdf, args=(), N=20, alternative='two-sided', mode='approx')
+		
+		#Assign Pnull
+		Pnull = nres[1]
+			
+	#Whether to return the parameters of the Gaussian mixture models
+	if not modparams:
+		return Phigh, Pnull, mod_h, isrt_h
+	else:
+		return Phigh, Pnull, mod_h, AIC, BIC, ms_h, covs_h, weights_h
+    
+
+def density_calculation(source_name,ra,dec,pllx,pmra,pmdec,vrad,designation):
+    dist=[]
+    c = coord.ICRS(ra=ra, dec=dec,  distance=pllx.to(u.pc, equivalencies=u.parallax()))
+    gc= c.transform_to(coord.Galactocentric)
+
+    x = gc.x.value
+    y = gc.y.value
+    z = gc.z.value
+
+    source_id=designation.index(source_name)
+    source_id_x = x[source_id]
+    source_id_y = y[source_id]
+    source_id_z = z[source_id]
+    for i in range(len(x)):
+        dist.append(math.sqrt((x[i]-source_id_x)**2+(y[i]-source_id_y)**2+(z[i]-source_id_z)**2))
+    a=np.where(~np.isnan(dist))[0]
+    b=pd.Series(dist)[a]
+    c=np.array(b)
+    d=np.where(c<=40.0)
+    source=c[d]
+    ra_used,dec_used,pllx_used,pmra_used,pmdec_used,vrad_used,designation_used,index,far=[],[],[],[],[],[],[],[],[]
+    for i in range(len(source)):
+        index.append(np.where(dist==source[i])[0][0])
+    for i in range(len(index)):
+        ra_used.append(ra[index[i]])
+        dec_used.append(dec[index[i]])
+        pllx_used.append(pllx[index[i]])
+        pmra_used.append(pmra[index[i]])
+        pmdec_used.append(pmdec[index[i]])
+        vrad_used.append(vrad[index[i]])
+        far.append(dist[index[i]])
+        designation_used.append(designation[index[i]])
+    ih_init=far.index(0)
+
+    dense_host=density(pllx_used*u.mas,ra_used*u.deg,dec_used*u.deg,pmra_used*u.mas/u.yr,pmdec_used*u.mas/u.yr,vrad=vrad_used*u.km/u.s,ih=ih_init,NST=600,subsize=40)[0]
+    dense=density(pllx_used*u.mas,ra_used*u.deg,dec_used*u.deg,pmra_used*u.mas/u.yr,pmdec_used*u.mas/u.yr,vrad=vrad_used*u.km/u.s,ih=ih_init,NST=600,subsize=40)[2]
+
+    return(source_name,('Phigh = '+ str(analyse_densedist(dense,dense_host=dense_host)[0])),('Pnull = '+str(analyse_densedist(dense,dense_host=dense_host)[1])))
+#------------------------------------------------------------------------------------------------------------------
+
+'''
+# what is our source? DR2 or eDR3? For Solar nbhd (80pc), use plain DR2/3 as they're (much) quicker to load
+#source_cat = 'eDR3'
+#source_cat = 'DR2'
+source_cat = 'eDR3_all'
+#source_cat = 'DR2_all'
+
+
+# get 80 pc RV sample
+# what is our source? DR2 or eDR3? For Solar nbhd (80pc), use plain DR2/3 as they're (much) quicker to load
+#source_cat = 'eDR3'
+#source_cat = 'DR2'
+source_cat = 'eDR3_all'
+#source_cat = 'DR2_all'
+
+
+# get 80 pc RV sample
+if source_cat == 'eDR3':
+    filename = "eDR3_RV_80pc.csv"
+    if os.path.exists(filename):
+        data_all = parse_single_table(filename).to_table()
+    else:
+        job = Gaia.launch_job_async("select * from gaiaedr3.gaia_source where parallax > 12.5 and "
+                                        "dr2_radial_velocity IS NOT NULL",dump_to_file=True,output_format = "csv",
+                                    output_file=filename)
+        r = job.get_results()
+        data_all = parse_single_table(filename).to_table()
+    data_all.rename_column('dr2_radial_velocity','radial_velocity')
+
+if source_cat == 'DR2':
+    filename = "DR2_RV_80pc.vot"
+    if os.path.exists(filename):
+        data_all = parse_single_table(filename).to_table()
+    else:
+        job = Gaia.launch_job_async("select * from gaiadr2.gaia_source where parallax > 12.5 and "
+                                        "radial_velocity IS NOT NULL",dump_to_file=True,output_format = "votable",
+                                    output_file=filename)
+        r = job.get_results()
+        data_all = parse_single_table(filename).to_table()
+
+#get full RV sample
+if source_cat == 'DR2_all':
+    for i in range(6):
+        filename = "DR2_RV_all_"+"{:1d}".format(i)+".vot"
+        if os.path.exists(filename):
+            tmp = parse_single_table(filename).to_table()
+            print("Read table "+"{:1d}".format(i+1)+" of 6")
+        else:
+            job = Gaia.launch_job_async("select designation, source_id, ref_epoch, ra, ra_error, dec, dec_error, "
+                                            "parallax, parallax_error, pmra, pmra_error, pmdec, pmdec_error, ra_dec_corr, "
+                                            "ra_parallax_corr, ra_pmra_corr, ra_pmdec_corr, dec_parallax_corr, dec_pmra_corr, "
+                                            "dec_pmdec_corr, parallax_pmra_corr, parallax_pmdec_corr, pmra_pmdec_corr, "
+                                            "astrometric_gof_al, astrometric_excess_noise, astrometric_excess_noise_sig, "
+                                            "phot_g_mean_flux, phot_g_mean_flux_error, phot_g_mean_mag, phot_bp_mean_flux, "
+                                            "phot_bp_mean_flux_error, phot_bp_mean_mag, phot_rp_mean_flux, "
+                                            "phot_rp_mean_flux_error, phot_rp_mean_mag, radial_velocity, "
+                                            "radial_velocity_error from gaiadr2.gaia_source where "
+                                            "radial_velocity IS NOT NULL and ra >= "+str(60*i)+" and "
+                                            "ra < "+str(60*(i+1)),dump_to_file=True,output_format = "votable",
+                                        output_file=filename)
+            print("Downloaded table "+"{:1d}".format(i+1)+" of 6")
+            r = job.get_results()
+           # tmp = parse_single_table(filename).to_table()
+            print("Read table "+"{:1d}".format(i+1)+" of 6")
+        if i == 0:
+            data_all = tmp
+        else:
+            data_all = vstack([data_all,tmp])
+
+if source_cat == 'eDR3_all':
+    for i in range(6):
+        filename = "eDR3_RV_all_"+"{:1d}".format(i)+".csv"
+        if os.path.exists(filename):
+            tmp = parse_single_table(filename).to_table()
+            print("Read table "+"{:1d}".format(i+1)+" of 6")
+        else:
+            job = Gaia.launch_job_async("select designation, source_id, ref_epoch, ra, ra_error, dec, dec_error, "
+                                            "parallax, parallax_error, pmra, pmra_error, pmdec, pmdec_error, ra_dec_corr, "
+                                            "ra_parallax_corr, ra_pmra_corr, ra_pmdec_corr, dec_parallax_corr, dec_pmra_corr, "
+                                            "dec_pmdec_corr, parallax_pmra_corr, parallax_pmdec_corr, pmra_pmdec_corr, "
+                                            "astrometric_gof_al, astrometric_excess_noise, astrometric_excess_noise_sig, "
+                                            "phot_g_mean_flux, phot_g_mean_flux_error, phot_g_mean_mag, phot_bp_mean_flux, "
+                                            "phot_bp_mean_flux_error, phot_bp_mean_mag, phot_rp_mean_flux, "
+                                            "phot_rp_mean_flux_error, phot_rp_mean_mag, dr2_radial_velocity, "
+                                            "dr2_radial_velocity_error from gaiaedr3.gaia_source where "
+                                            "dr2_radial_velocity IS NOT NULL and ra >= "+str(60*i)+" and "
+                                            "ra < "+str(60*(i+1)),dump_to_file=True,output_format = "csv",
+                                        output_file=filename)
+            print("Downloaded table "+"{:1d}".format(i+1)+" of 6")
+            r = job.get_results()
+            tmp = parse_single_table(filename).to_table()
+            print("Read table "+"{:1d}".format(i+1)+" of 6")
+        if i == 0:
+            data_all = tmp
+        else:
+            data_all = vstack([data_all,tmp])
+    
+    data_all.rename_column('dr2_radial_velocity','radial_velocity')
+    data_all.rename_column('dr2_radial_velocity_error','radial_velocity_error')        
+
+          
+if source_cat != 'eDR3' and source_cat != 'DR2' and source_cat != 'DR2_all' and source_cat != 'eDR3_all':
+    print('Specify correct DR')
+    assert(False)
+'''
+
+for i in range(6):
+    filename = "C:/Users/23503/eDR3_RV_all_simple_"+"{:1d}".format(i)+".vot"
+    tmp = parse_single_table(filename).to_table()
+    if i == 0:
+        data_all = tmp
+    else:
+        data_all = vstack([data_all,tmp])
+print('complete fileread')
+data=pd.read_csv('D:/data/all data/hostname_final.csv')       
+gaia_id_true=data['gaia_id']        
+gaia_id_all=data_all['designation']        
+designation_init=[]
+for i in range(len(gaia_id_all)):
+    designation_init.append(str(gaia_id_all[i],encoding="utf-8"))
+ra_init=list(data_all['ra'])
+dec_init=list(data_all['dec'])
+pllx_init=list(data_all['parallax'])
+pmra_init=list(data_all['pmra'])
+pmdec_init=list(data_all['pmdec'])
+vrad_init=list(data_all['dr2_radial_velocity'])
+df=pd.DataFrame({'designation_init':designation_init,'ra_init':ra_init,'dec_init':dec_init,'pllx_init':pllx_init,'pmra_init':pmra_init,'pmdec_init':pmdec_init,'vrad_init':vrad_init})
+designation_number=[int(item[10:]) for item in designation_init ]
+sorted_id = sorted(range(len(designation_number)),key = lambda  k:designation_number[k] )
+designation_sort=df['designation_init'][sorted_id]
+ra_sort=df['ra_init'][sorted_id]
+dec_sort=df['dec_init'][sorted_id]
+pllx_sort=df['pllx_init'][sorted_id]
+pmra_sort=df['pmra_init'][sorted_id]
+pmdec_sort=df['pmdec_init'][sorted_id]
+vrad_sort=df['vrad_init'][sorted_id]
+Phigh=[]
+Pnull=[]
+Hostname=[]
+for item in gaia_id_true:
+    try:
+        if item in designation_sort.unique() :
+            ind = designation_sort[designation_sort.values==item].index[0]    
+            num_top=ind + 400000
+            num_bot=ind - 400000
+            if num_top > 7209831:
+                num_top = 7209831
+                num_bot = 7209831-800000
+            if num_bot < 0:
+                num_bot = 0
+                num_top = 800000
+            seq=list(range(num_bot,num_top))
+            designation_used=list(designation_sort[seq].values)
+            if item in designation_used:
+                ra_used=list(ra_sort[seq].values)
+                dec_used=list(dec_sort[seq].values)
+                pllx_used=list(pllx_sort[seq].values)
+                pmra_used=list(pmra_sort[seq].values)
+                pmdec_used=list(pmdec_sort[seq].values)
+                vrad_used=list(vrad_sort[seq].values)
+                ih=designation_used.index(item)
+                result=(density_calculation(item,ra_used*u.deg,dec_used*u.deg,pllx_used*u.mas,pmra_used,pmdec_used,vrad_used,designation_used))
+                Hostname.append(result[0])
+                Phigh.append(result[1])
+                Pnull.append(result[2])
+                if len(Phigh)==100:
+                    df1=pd.DataFrame({'host_id':Hostname,"Phigh":Phigh,"Pnull":Pnull})
+                    df1.to_csv("D:/data/my result/result(1-100).csv")
+                elif len(Phigh)==200:
+                    df2=pd.DataFrame({'host_id':Hostname[100:200],"Phigh":Phigh[100:200],"Pnull":Pnull[100:200]})
+                    df2.to_csv("D:/data/my result/result(100-200).csv")
+                elif len(Phigh)==300:
+                    df3=pd.DataFrame({'host_id':Hostname[200:300],"Phigh":Phigh[200:300],"Pnull":Pnull[200:300]})
+                    df3.to_csv("D:/data/my result/result(200-300).csv")
+                elif len(Phigh)==400:
+                    df4=pd.DataFrame({'host_id':Hostname[300:400],"Phigh":Phigh[300:400],"Pnull":Pnull[300:400]})
+                    df4.to_csv("D:/data/my result/result(300-400).csv")
+                elif len(Phigh)==500:
+                    df5=pd.DataFrame({'host_id':Hostname[400:500],"Phigh":Phigh[400:500],"Pnull":Pnull[400:500]})
+                    df5.to_csv("D:/data/my result/result(400-500).csv")
+                elif len(Phigh)==600:
+                    df6=pd.DataFrame({'host_id':Hostname[500:600],"Phigh":Phigh[500:600],"Pnull":Pnull[500:600]})
+                    df6.to_csv("D:/data/my result/result(500-600).csv")
+                elif len(Phigh)==700:
+                    df7=pd.DataFrame({'host_id':Hostname[600:700],"Phigh":Phigh[600:700],"Pnull":Pnull[600:700]})
+                    df7.to_csv("D:/data/my result/result(600-700).csv")
+                elif len(Phigh)==800:
+                    df8=pd.DataFrame({'host_id':Hostname[700:800],"Phigh":Phigh[700:800],"Pnull":Pnull[700:800]})
+                    df8.to_csv("D:/data/my result/result(700-800).csv")
+                elif len(Phigh)==900:
+                    df9=pd.DataFrame({'host_id':Hostname[800:900],"Phigh":Phigh[800:900],"Pnull":Pnull[800:900]})
+                    df9.to_csv("D:/data/my result/result(800-900).csv")
+                elif len(Phigh)==1000:
+                    df10=pd.DataFrame({'host_id':Hostname[900:1000],"Phigh":Phigh[900:1000],"Pnull":Pnull[900:1000]})
+                    df10.to_csv("D:/data/my result/result(900:1000).csv")
+                elif len(Phigh)==1100:
+                    df11=pd.DataFrame({'host_id':Hostname[1000:1100],"Phigh":Phigh[1000:1100],"Pnull":Pnull[1000:1100]})
+                    df11.to_csv("D:/data/my result/result(1000:1100).csv")        
+                       
+    except:
+       pass
+df12=pd.DataFrame({'host_id':Hostname[1100:],"Phigh":Phigh[1100:],"Pnull":Pnull[1100:]})
+df12.to_csv("D:/data/my result/result(1100-).csv")            
+            
+
+    
+    
+#每跑100个存一个csv
+
+'''
+designation_number=[int(item[10:]) for item in designation_init ]
+sorted_id = sorted(range(len(designation_number)),key = lambda  k:designation_number[k] )
+
+output=
+for item in gaia_id_true:
+    number=int(item[10:])
+    num_top=number + 500000000000000000
+    num_bot=number - 500000000000000000
+    if num_top > 6917528443525529728:
+        num_top = 6917528443525529728
+        num_bot = 5917528443525529728
+    if num_bot < 0:
+        num_bot = 0
+        num_bot = 1000000000000000000
+    designation_init =[i for i in designation_number if i>num_bot and i <num_top]
+    designation_init_str = [str(i) for i in designation_init]
+    designation_cut = ['Gaia EDR3 '+item for item in designation_init_str]
+    #记得清空index
+    index=[designation.index(item) for item in designation_cut]
+    
+'''    
+
+'''        
+data_all.rename_column('dr2_radial_velocity','radial_velocity')
+data_all.rename_column('dr2_radial_velocity_error','radial_velocity_error')    
+
+data_all.add_column(data_all['phot_bp_mean_mag'] - data_all['phot_rp_mean_mag'],name='BP_RP')      #colour BP_RP
+data_all.add_column(data_all['phot_g_mean_mag']+5*np.log10(data_all['parallax']/100),name='M_G')   #absolute M_G
+
+data_all['pmra'].unit = units.mas/units.yr
+data_all['pmdec'].unit = units.mas/units.yr
+data_all['radial_velocity'].unit = units.km/units.s
+
+N_stars_all = len(data_all)
+
+print('{:d} stars read'.format(N_stars_all))
+'''
